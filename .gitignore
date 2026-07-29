@@ -1,0 +1,12 @@
+.venv/
+.env
+.linkedin_profile/
+__pycache__/
+*.pyc
+
+# Generated output, not source
+java_contract_jobs_*.csv
+job_viewer_data.js
+job_agent_log.txt
+debug_*.txt
+debug_*.html
