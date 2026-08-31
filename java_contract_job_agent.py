@@ -22,10 +22,13 @@ Usage:
     python java_contract_job_agent.py
 """
 
+import ctypes
 import json
 import os
 import re
 import smtplib
+import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.message import EmailMessage
@@ -38,6 +41,33 @@ from jobspy import scrape_jobs
 from linkedin_posts_scraper import scrape_posts
 
 load_dotenv()
+
+# When output is redirected to a file (as the scheduled task does), Python
+# fully buffers stdout instead of flushing per line. If the process is then
+# killed (e.g. the machine goes to sleep mid-run), whatever was still in the
+# buffer is lost — which is why some failed runs left no trace in the log at
+# all. Reopen stdout/stderr unbuffered so every print lands on disk immediately.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# ------------------------- KEEP-AWAKE (Windows) ------------------------------
+# A running task doesn't by itself stop Windows from sleeping. If the machine
+# suspends mid-run, the process gets killed outright (surfaces as Windows
+# status STATUS_CONTROL_C_EXIT) instead of pausing and resuming. Tell Windows
+# to stay awake for the duration of this script, then release that hold when
+# done so normal sleep behavior resumes afterward.
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def prevent_sleep() -> None:
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+
+def allow_sleep() -> None:
+    if sys.platform == "win32":
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 VIEWER_DATA_FILE = SCRIPT_DIR / "job_viewer_data.js"
@@ -309,6 +339,24 @@ def _scrape_posts_source() -> list[pd.DataFrame]:
 
 
 def run() -> pd.DataFrame:
+    start = datetime.now()
+    print(f"=== RUN START {start:%Y-%m-%d %H:%M:%S} (pid={os.getpid()}) ===")
+    prevent_sleep()
+    try:
+        result = _run()
+        print(f"=== RUN END {datetime.now():%Y-%m-%d %H:%M:%S} "
+              f"(status=ok, duration={datetime.now() - start}) ===")
+        return result
+    except Exception:
+        print(f"=== RUN END {datetime.now():%Y-%m-%d %H:%M:%S} "
+              f"(status=FAILED, duration={datetime.now() - start}) ===")
+        traceback.print_exc()
+        raise
+    finally:
+        allow_sleep()
+
+
+def _run() -> pd.DataFrame:
     # The job board (plain HTTP requests via jobspy) and the posts scraper
     # (a full browser scrolling/expanding through search results) don't share
     # any state, so run them concurrently instead of back-to-back — the posts
@@ -430,4 +478,7 @@ def run() -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    run()
+    try:
+        run()
+    except Exception:
+        sys.exit(1)
