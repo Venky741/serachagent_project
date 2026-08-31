@@ -75,15 +75,33 @@ VIEWER_DATA_FILE = SCRIPT_DIR / "job_viewer_data.js"
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 GMAIL_TO = os.environ.get("GMAIL_TO", GMAIL_USER)
+GMAIL_TO_DOTNET = os.environ.get("GMAIL_TO_DOTNET", GMAIL_TO)
+GMAIL_TO_OA = os.environ.get("GMAIL_TO_OA", GMAIL_TO)
 
 # ----------------------------- CONFIG ---------------------------------------
 
-SEARCH_TERMS = [
+JAVA_SEARCH_TERMS = [
     "Senior Java Developer",
     "Java Developer",
     "Java Full Stack Developer",
     "Java Backend Developer",
 ]
+
+DOTNET_SEARCH_TERMS = [
+    "Senior .NET Developer",
+    ".NET Developer",
+    ".NET Full Stack Developer",
+    ".NET Backend Developer",
+]
+
+QA_SEARCH_TERMS = [
+    "QA Engineer",
+    "Quality Engineer",
+    "QA Automation Engineer",
+    "SDET",
+]
+
+SEARCH_TERMS = JAVA_SEARCH_TERMS + DOTNET_SEARCH_TERMS + QA_SEARCH_TERMS
 
 # Boards to search. LinkedIn is the main one you asked for.
 # You can add: "indeed", "zip_recruiter", "glassdoor"
@@ -139,6 +157,12 @@ CANDIDATE_SELF_POST_PATTERN = re.compile(
 # Require Java to actually be a subject of the role, not just mentioned in
 # passing. \bjava\b won't match "javascript" (no word boundary after "java").
 JAVA_ROLE_PATTERN = re.compile(r"\bjava\b(?!\s*script)", re.IGNORECASE)
+DOTNET_ROLE_PATTERN = re.compile(r"\.net\b|\bdot\s*net\b", re.IGNORECASE)
+QA_ROLE_PATTERN = re.compile(
+    r"\bqa\b|\bsdet\b|\bquality\s+(?:engineer|assurance)\b|"
+    r"\bautomation\s+(?:test|qa)\s*engineer\b",
+    re.IGNORECASE,
+)
 
 EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 PHONE_PATTERN = re.compile(
@@ -204,6 +228,18 @@ def is_java_role(description: str, title: str) -> bool:
     return bool(JAVA_ROLE_PATTERN.search((description or "")[:300]))
 
 
+def is_dotnet_role(description: str, title: str) -> bool:
+    if DOTNET_ROLE_PATTERN.search(title or ""):
+        return True
+    return bool(DOTNET_ROLE_PATTERN.search((description or "")[:300]))
+
+
+def is_qa_role(description: str, title: str) -> bool:
+    if QA_ROLE_PATTERN.search(title or ""):
+        return True
+    return bool(QA_ROLE_PATTERN.search((description or "")[:300]))
+
+
 def write_viewer_data(jobs: pd.DataFrame, outfile: str) -> None:
     """Dump the latest run as job_viewer_data.js so job_viewer.html can auto-load it."""
     records = jobs.where(pd.notnull(jobs), "").to_dict(orient="records")
@@ -226,9 +262,9 @@ def _html_escape(text: str) -> str:
     )
 
 
-def send_email_notification(jobs: pd.DataFrame, outfile: str) -> None:
-    if not (GMAIL_USER and GMAIL_APP_PASSWORD and GMAIL_TO):
-        print("  (skipping email: GMAIL_USER / GMAIL_APP_PASSWORD / GMAIL_TO not set in .env)")
+def send_email_notification(jobs: pd.DataFrame, outfile: str, recipients: str, label: str) -> None:
+    if not (GMAIL_USER and GMAIL_APP_PASSWORD and recipients):
+        print(f"  (skipping {label} email: GMAIL_USER / GMAIL_APP_PASSWORD / recipients not set in .env)")
         return
 
     count = len(jobs)
@@ -264,7 +300,7 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str) -> None:
 
     html = f"""\
     <div style="font-family:Arial,Helvetica,sans-serif;color:#1c1c1f;">
-      <p><strong>{count}</strong> contract/C2C Java job(s) found this run
+      <p><strong>{count}</strong> contract/C2C {_html_escape(label)} job(s) found this run
          &middot; <strong>{with_email}</strong> include a vendor email.</p>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <thead>
@@ -283,11 +319,11 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str) -> None:
     """
 
     msg = EmailMessage()
-    msg["Subject"] = f"Java Contract C2C Jobs — {count} found ({datetime.now():%Y-%m-%d %H:%M})"
+    msg["Subject"] = f"{label} Contract C2C Jobs — {count} found ({datetime.now():%Y-%m-%d %H:%M})"
     msg["From"] = GMAIL_USER
-    msg["To"] = GMAIL_TO
+    msg["To"] = recipients
     msg.set_content(
-        f"{count} contract/C2C Java job(s) found this run.\n"
+        f"{count} contract/C2C {label} job(s) found this run.\n"
         f"{with_email} include a vendor email in the posting.\n\n" +
         "\n\n".join(plain_lines) +
         f"\n\nFull list saved locally to {outfile}."
@@ -297,7 +333,7 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
-    print(f"  Emailed summary to {GMAIL_TO}")
+    print(f"  Emailed {label} summary to {recipients}")
 
 
 # ----------------------------- MAIN -----------------------------------------
@@ -402,6 +438,12 @@ def _run() -> pd.DataFrame:
     jobs["is_java_role"] = [
         is_java_role(d, t) for d, t in zip(jobs["description"], jobs["title"])
     ]
+    jobs["is_dotnet_role"] = [
+        is_dotnet_role(d, t) for d, t in zip(jobs["description"], jobs["title"])
+    ]
+    jobs["is_qa_role"] = [
+        is_qa_role(d, t) for d, t in zip(jobs["description"], jobs["title"])
+    ]
     jobs["is_candidate_self_post"] = [
         is_candidate_self_post(d, t) for d, t in zip(jobs["description"], jobs["title"])
     ]
@@ -412,23 +454,36 @@ def _run() -> pd.DataFrame:
     has_contact = (jobs["vendor_emails"].fillna("") != "") | (jobs["vendor_phones"].fillna("") != "")
     is_post = jobs["site"] == "linkedin_posts"
 
-    # Only Java contract postings that mention C2C, don't explicitly reject
-    # it, aren't a recruiter marketing bench consultants, and aren't a
-    # candidate advertising themselves rather than an open role
-    jobs = jobs[
+    # Contract postings that mention C2C, don't explicitly reject it, aren't
+    # a recruiter marketing bench consultants, and aren't a candidate
+    # advertising themselves rather than an open role. Role-specific (Java /
+    # .NET) filtering is applied separately below so each can be emailed to
+    # its own distribution list.
+    common_mask = (
         (jobs["job_type"] == "contract")
         & (jobs["c2c_mentioned"])
         & (~jobs["rejects_c2c"])
         & (~jobs["is_hotlist"])
         & (~jobs["is_candidate_self_post"])
-        & (jobs["is_java_role"])
         & (~is_post | has_contact)
-    ]
+    )
 
-    if jobs.empty:
-        print("No contract/C2C postings matched this run.")
-        return jobs
+    java_jobs = jobs[common_mask & jobs["is_java_role"]]
+    dotnet_jobs = jobs[common_mask & jobs["is_dotnet_role"]]
+    qa_jobs = jobs[common_mask & jobs["is_qa_role"]]
 
+    if java_jobs.empty and dotnet_jobs.empty and qa_jobs.empty:
+        print("No contract/C2C postings (Java, .NET, or QA) matched this run.")
+        return pd.DataFrame()
+
+    java_jobs = _process_group(java_jobs, "Java", "java_contract_jobs", GMAIL_TO, write_viewer=True)
+    _process_group(dotnet_jobs, ".NET", "dotnet_contract_jobs", GMAIL_TO_DOTNET)
+    _process_group(qa_jobs, "QA / Quality Engineer", "qa_contract_jobs", GMAIL_TO_OA)
+
+    return java_jobs
+
+
+def _prepare_output_columns(jobs: pd.DataFrame) -> pd.DataFrame:
     # Columns jobspy only populates for other boards (Indeed/ZipRecruiter/
     # Glassdoor), never for LinkedIn — drop them to keep the CSV readable.
     ALWAYS_EMPTY_FOR_LINKEDIN = [
@@ -444,10 +499,10 @@ def _run() -> pd.DataFrame:
     )
     # These are only informative when they're True/non-empty; once filtered,
     # every surviving row has rejects_c2c == False, so drop the noise.
-    jobs = jobs.drop(columns=[
+    jobs = jobs.drop(columns=[c for c in [
         "rejects_c2c", "rejects_c2c_evidence", "is_hotlist",
-        "is_java_role", "is_candidate_self_post",
-    ])
+        "is_java_role", "is_dotnet_role", "is_qa_role", "is_candidate_self_post",
+    ] if c in jobs.columns])
 
     # Tidy column order: vendor + job details first, description last
     preferred = [
@@ -460,19 +515,30 @@ def _run() -> pd.DataFrame:
         + [c for c in jobs.columns if c not in preferred and c != "description"]
         + ["description"]
     )
-    jobs = jobs[cols].sort_values("date_posted", ascending=False)
+    return jobs[cols].sort_values("date_posted", ascending=False)
 
-    # Save
+
+def _process_group(
+    jobs: pd.DataFrame, label: str, filename_prefix: str, recipients: str,
+    write_viewer: bool = False,
+) -> pd.DataFrame:
+    if jobs.empty:
+        print(f"No {label} contract/C2C postings matched this run.")
+        return jobs
+
+    jobs = _prepare_output_columns(jobs)
+
     stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
-    outfile = f"java_contract_jobs_{stamp}.csv"
+    outfile = f"{filename_prefix}_{stamp}.csv"
     jobs.to_csv(outfile, index=False)
 
-    print(f"\nSaved {len(jobs)} contract/C2C jobs -> {outfile}")
+    print(f"\nSaved {len(jobs)} {label} contract/C2C jobs -> {outfile}")
     print(f"  Postings with a vendor email: "
           f"{int((jobs['vendor_emails'] != '').sum())}")
 
-    write_viewer_data(jobs, outfile)
-    send_email_notification(jobs, outfile)
+    if write_viewer:
+        write_viewer_data(jobs, outfile)
+    send_email_notification(jobs, outfile, recipients, label)
 
     return jobs
 
