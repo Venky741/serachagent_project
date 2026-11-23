@@ -32,6 +32,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from email.message import EmailMessage
+from email.utils import getaddresses
 from pathlib import Path
 
 import pandas as pd
@@ -117,22 +118,26 @@ JOB_TYPE = "contract"        # contract roles only
 HOURS_OLD = 1                # only postings from the last hour
 RESULTS_PER_TERM = 50        # per search term, per site
 
-POSTS_MAX_AGE_MINUTES = 60
+POSTS_MAX_AGE_MINUTES = 120
 
 C2C_PATTERN = re.compile(
-    r"\b(c2c|corp[\s\-]?to[\s\-]?corp|1099|w2\s*/\s*c2c|c2c\s*/\s*w2)\b",
+    r"\b(c2c|corp[\s\-]?to[\s\-]?corp|w2\s*/\s*c2c|c2c\s*/\s*w2)\b",
     re.IGNORECASE,
 )
+WEAK_1099_PATTERN = re.compile(r"\b1099\b", re.IGNORECASE)
 # Postings that explicitly reject C2C (or say W2-only) should be excluded even
 # though they contain the word "c2c" and would otherwise trip C2C_PATTERN.
 NO_C2C_PATTERN = re.compile(
     r"\b(no\s*c2c|not\s*open\s*to\s*c2c|"
     r"unable\s*to\s*(?:do|sponsor)\s*c2c|cannot\s*do\s*c2c|"
+    r"(?:will\s+)?not\s+accept(?:ing)?\s+(?:on\s+)?c2c|"
+    r"won['’]?t\s+accept\s+(?:on\s+)?c2c|"
     r"w-?2\s*only|only\s*w-?2|"
     r"w-?2\s*(?:candidates?|contractors?|basis|employment)\s*only|"
     r"only\s*w-?2\s*(?:candidates?|contractors?)|"
     r"w-?2\s*salaried\s*employee|"
-    r"c2c\s*not\s*(?:accepted|available|allowed))\b",
+    r"c2c\s*not\s*(?:accepted|available|allowed)|"
+    r"c2c\s*(?:and|&)\s*sponsorship\s*:\s*not\s+available)\b",
     re.IGNORECASE,
 )
 # Recruiters marketing available bench consultants, not an actual open role.
@@ -268,7 +273,7 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str, recipients: str, l
         return
 
     count = len(jobs)
-    with_email = int((jobs["vendor_emails"] != "").sum())
+    with_email = int((jobs["vendor_emails"] != "").sum()) if "vendor_emails" in jobs else 0
     shown = jobs.head(40)
 
     plain_lines = []
@@ -298,9 +303,13 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str, recipients: str, l
             <td style="padding:8px 10px;border-bottom:1px solid #e0e0e5;">{link_cell}</td>
           </tr>""")
 
+    summary = (
+        f"{count} contract/C2C {label} job(s) found this run."
+        if count else f"No contract/C2C {label} postings matched this run."
+    )
     html = f"""\
     <div style="font-family:Arial,Helvetica,sans-serif;color:#1c1c1f;">
-      <p><strong>{count}</strong> contract/C2C {_html_escape(label)} job(s) found this run
+            <p>{_html_escape(summary)}
          &middot; <strong>{with_email}</strong> include a vendor email.</p>
       <table style="border-collapse:collapse;width:100%;font-size:13px;">
         <thead>
@@ -323,7 +332,7 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str, recipients: str, l
     msg["From"] = GMAIL_USER
     msg["To"] = recipients
     msg.set_content(
-        f"{count} contract/C2C {label} job(s) found this run.\n"
+        f"{summary}\n"
         f"{with_email} include a vendor email in the posting.\n\n" +
         "\n\n".join(plain_lines) +
         f"\n\nFull list saved locally to {outfile}."
@@ -332,8 +341,32 @@ def send_email_notification(jobs: pd.DataFrame, outfile: str, recipients: str, l
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        smtp.send_message(msg)
-    print(f"  Emailed {label} summary to {recipients}")
+        refused = smtp.send_message(msg)
+    recipient_count = len([address for _, address in getaddresses([recipients]) if address])
+    accepted_count = recipient_count - len(refused)
+    if refused:
+        print(f"  SMTP accepted {accepted_count}/{recipient_count} {label} recipient(s); refused {len(refused)}")
+    else:
+        print(f"  SMTP accepted {accepted_count}/{recipient_count} {label} recipient(s); delivery not confirmed")
+
+
+def _deduplicate_jobs(jobs: pd.DataFrame) -> pd.DataFrame:
+    descriptions = (
+        jobs["description"].fillna("").astype(str)
+        .str.replace(r"\s+", " ", regex=True).str.strip().str.casefold()
+    )
+    is_post = jobs["site"].eq("linkedin_posts")
+    urls = jobs["job_url"].fillna("").astype(str).str.strip()
+    has_url = urls.ne("")
+
+    dedup_key = pd.Series("", index=jobs.index, dtype="object")
+    dedup_key.loc[is_post] = "post:" + descriptions.loc[is_post]
+    board_urls = ~is_post & has_url
+    dedup_key.loc[board_urls] = "url:" + urls.loc[board_urls]
+    board_without_urls = ~is_post & ~has_url
+    dedup_key.loc[board_without_urls] = "description:" + descriptions.loc[board_without_urls].str[:200]
+
+    return jobs.loc[~dedup_key.duplicated(keep="first")]
 
 
 # ----------------------------- MAIN -----------------------------------------
@@ -409,12 +442,8 @@ def _run() -> pd.DataFrame:
 
     jobs = pd.concat(frames, ignore_index=True)
 
-    # De-duplicate (same job often matches both search terms). Posts without
-    # an extractable author link have no job_url, so dedup on a separate key
-    # instead of overwriting job_url with a fake, non-clickable placeholder.
-    missing_url = jobs["job_url"].isna() | (jobs["job_url"] == "")
-    dedup_key = jobs["job_url"].where(~missing_url, "post:" + jobs["description"].str[:200])
-    jobs = jobs[~dedup_key.duplicated(keep="first")]
+    # Post links identify the author, not the post, so dedupe those by content.
+    jobs = _deduplicate_jobs(jobs)
 
     # Vendor contact extraction + C2C flag
     contacts = jobs["description"].apply(extract_contacts)
@@ -474,6 +503,9 @@ def _run() -> pd.DataFrame:
 
     if java_jobs.empty and dotnet_jobs.empty and qa_jobs.empty:
         print("No contract/C2C postings (Java, .NET, or QA) matched this run.")
+        _process_group(java_jobs, "Java", "java_contract_jobs", GMAIL_TO, write_viewer=True)
+        _process_group(dotnet_jobs, ".NET", "dotnet_contract_jobs", GMAIL_TO_DOTNET)
+        _process_group(qa_jobs, "QA / Quality Engineer", "qa_contract_jobs", GMAIL_TO_OA)
         return pd.DataFrame()
 
     java_jobs = _process_group(java_jobs, "Java", "java_contract_jobs", GMAIL_TO, write_viewer=True)
@@ -524,6 +556,9 @@ def _process_group(
 ) -> pd.DataFrame:
     if jobs.empty:
         print(f"No {label} contract/C2C postings matched this run.")
+        send_email_notification(
+            pd.DataFrame(columns=["vendor_emails"]), "", recipients, label
+        )
         return jobs
 
     jobs = _prepare_output_columns(jobs)

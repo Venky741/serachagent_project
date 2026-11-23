@@ -102,7 +102,7 @@ def _parse_card_text(text: str) -> dict | None:
     return {"author": author, "description": description, "age_minutes": age_minutes}
 
 
-def scrape_posts(search_terms: list[str], max_scrolls: int = 6, max_age_minutes: int = 60) -> list[dict]:
+def scrape_posts(search_terms: list[str], max_scrolls: int = 6, max_age_minutes: int = 120) -> list[dict]:
     if not PROFILE_DIR.exists():
         print("  (skipping posts scrape: no LinkedIn session - run linkedin_login.py first)")
         return []

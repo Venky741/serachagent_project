@@ -6,6 +6,9 @@ __pycache__/
 
 # Generated output, not source
 java_contract_jobs_*.csv
+dotnet_contract_jobs_*.csv
+qa_contract_jobs_*.csv
+oa_contract_jobs_*.csv
 job_viewer_data.js
 job_agent_log.txt
 debug_*.txt
